@@ -1,0 +1,13 @@
+{
+  "name": "nesl-file-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NeSL File Downloader with React/Vite UI and Node/Selenium backend",
+  "scripts": {
+    "dev": "concurrently -k \"npm run dev --prefix frontend\" \"npm run dev --prefix backend\"",
+    "build": "npm run build --prefix frontend",
+    "start": "npm run start --prefix backend",
+    "install:all": "npm install && npm install --prefix frontend && npm install --prefix backend"
+  },
+  "devDependencies": { "concurrently": "^9.1.2" }
+}

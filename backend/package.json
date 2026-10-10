@@ -1,0 +1,14 @@
+{
+  "name": "nesl-file-downloader-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "node --watch src/server.js", "start": "node src/server.js" },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "selenium-webdriver": "^4.27.0"
+  }
+}
