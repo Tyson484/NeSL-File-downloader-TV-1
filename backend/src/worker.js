@@ -281,7 +281,7 @@ async function searchTransaction(driver, wait, transactionId) {
           }
         }
       } catch {
-        // Ignore rows that disappear while the table updates.
+        // The table may update while rows are being inspected.
       }
     }
 
@@ -348,11 +348,10 @@ async function searchTransaction(driver, wait, transactionId) {
 }
 
 /**
- * Trigger a document download from the portal.
+ * Download a PDF from the NeSL portal.
  */
 async function downloadPdf(driver, downloadDir, job) {
   const before = await listPdfs(downloadDir);
-
   const deadline = Date.now() + WAIT_MS;
 
   while (Date.now() < deadline) {
@@ -386,7 +385,6 @@ async function downloadPdf(driver, downloadDir, job) {
               }
 
               downloadfile(link.id);
-
               return link.id;
             }
           }
@@ -428,7 +426,7 @@ async function downloadPdf(driver, downloadDir, job) {
 }
 
 /**
- * Retry document downloads when retry is enabled.
+ * Retry PDF downloads up to three times when enabled.
  */
 async function downloadWithRetry(
   driver,
@@ -478,7 +476,7 @@ async function downloadWithRetry(
 }
 
 /**
- * Escape CSV values.
+ * CSV utilities.
  */
 function csvCell(value) {
   return `"${String(value ?? '').replaceAll('"', '""')}"`;
@@ -489,8 +487,7 @@ async function appendCsv(file, headers, row) {
     fs.existsSync(file) &&
     fs.statSync(file).size > 0;
 
-  const line =
-    row.map(csvCell).join(',') + '\r\n';
+  const line = row.map(csvCell).join(',') + '\r\n';
 
   if (!exists) {
     await fs.promises.appendFile(
@@ -504,11 +501,7 @@ async function appendCsv(file, headers, row) {
 }
 
 /**
- * Create Chrome options suitable for local development and Render.
- *
- * IMPORTANT:
- * This configures Chrome to run headlessly on Render.
- * Chrome must still be installed in the server environment.
+ * Configure Chromium for Render's Docker environment.
  */
 function createChromeOptions(downloadDir) {
   const options = new chrome.Options();
@@ -519,25 +512,31 @@ function createChromeOptions(downloadDir) {
     isRender ||
     String(process.env.CHROME_HEADLESS).toLowerCase() === 'true';
 
+  const chromeBinary =
+    process.env.CHROME_BIN ||
+    (isRender ? '/usr/bin/chromium' : '');
+
+  if (chromeBinary) {
+    options.setChromeBinaryPath(chromeBinary);
+  }
+
   if (isHeadless) {
     options.addArguments(
       '--headless=new',
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--window-size=1440,1000'
+      '--disable-extensions',
+      '--disable-popup-blocking',
+      '--window-size=1440,1000',
+      '--remote-debugging-port=0'
     );
   } else {
-    options.addArguments('--start-maximized');
-  }
-
-  options.addArguments(
-    '--disable-popup-blocking',
-    '--disable-extensions'
-  );
-
-  if (process.env.CHROME_BIN) {
-    options.setChromeBinaryPath(process.env.CHROME_BIN);
+    options.addArguments(
+      '--start-maximized',
+      '--disable-popup-blocking',
+      '--disable-extensions'
+    );
   }
 
   options.setUserPreferences({
@@ -648,20 +647,71 @@ export async function runDownloadJob({
     addLog(
       job,
       'info',
+      'Checking Chromium and ChromeDriver configuration.'
+    );
+
+    const isRender = Boolean(process.env.RENDER);
+
+    const chromeBinary =
+      process.env.CHROME_BIN ||
+      (isRender ? '/usr/bin/chromium' : '');
+
+    const chromeDriverPath =
+      process.env.CHROMEDRIVER_PATH ||
+      (isRender ? '/usr/bin/chromedriver' : '');
+
+    if (chromeBinary) {
+      addLog(job, 'info', `Chromium path: ${chromeBinary}`);
+
+      if (!fs.existsSync(chromeBinary)) {
+        throw new Error(
+          `Chromium executable was not found at ${chromeBinary}. Check the Dockerfile.`
+        );
+      }
+    }
+
+    if (chromeDriverPath) {
+      addLog(
+        job,
+        'info',
+        `ChromeDriver path: ${chromeDriverPath}`
+      );
+
+      if (!fs.existsSync(chromeDriverPath)) {
+        throw new Error(
+          `ChromeDriver executable was not found at ${chromeDriverPath}. Check the Dockerfile.`
+        );
+      }
+    }
+
+    addLog(
+      job,
+      'info',
       'Starting Chrome and opening the NeSL portal.'
     );
 
-    driver = await new Builder()
+    const builder = new Builder()
       .forBrowser('chrome')
-      .setChromeOptions(chromeOptions)
-      .build();
+      .setChromeOptions(chromeOptions);
+
+    if (chromeDriverPath) {
+      const service = new chrome.ServiceBuilder(chromeDriverPath);
+      builder.setChromeService(service);
+    }
+
+    driver = await builder.build();
+
+    addLog(
+      job,
+      'success',
+      'Chrome started successfully.'
+    );
 
     /*
-     * Chrome's download preferences alone may not be enough
-     * for headless Chrome. Enable downloads through CDP too.
+     * Allow PDF downloads in headless Chromium.
      */
     if (
-      process.env.RENDER ||
+      isRender ||
       String(process.env.CHROME_HEADLESS).toLowerCase() === 'true'
     ) {
       try {
@@ -690,24 +740,50 @@ export async function runDownloadJob({
 
     await driver.get(PORTAL_URL);
 
+    addLog(
+      job,
+      'info',
+      'NeSL portal opened. Waiting for the login form.'
+    );
+
     await driver.wait(
       until.elementLocated(By.id('username')),
       WAIT_MS
     );
 
-    await (
-      await driver.findElement(By.id('username'))
-    ).sendKeys(username || process.env.NESL_USERNAME);
+    const usernameInput = await driver.findElement(
+      By.id('username')
+    );
 
-    await (
-      await driver.findElement(By.id('password'))
-    ).sendKeys(password || process.env.NESL_PASSWORD);
+    const passwordInput = await driver.findElement(
+      By.id('password')
+    );
 
-    await (
-      await driver.findElement(
-        By.css("button[type='submit']")
-      )
-    ).click();
+    if (!username && !process.env.NESL_USERNAME) {
+      throw new Error(
+        'NeSL username was not provided for this job.'
+      );
+    }
+
+    if (!password && !process.env.NESL_PASSWORD) {
+      throw new Error(
+        'NeSL password was not provided for this job.'
+      );
+    }
+
+    await usernameInput.sendKeys(
+      username || process.env.NESL_USERNAME
+    );
+
+    await passwordInput.sendKeys(
+      password || process.env.NESL_PASSWORD
+    );
+
+    const loginButton = await driver.findElement(
+      By.css("button[type='submit']")
+    );
+
+    await loginButton.click();
 
     await driver.wait(
       until.elementLocated(
@@ -900,6 +976,14 @@ export async function runDownloadJob({
       'success',
       `Finished. PDFs are saved to ${outputDir}`
     );
+  } catch (error) {
+    addLog(
+      job,
+      'error',
+      `Download job stopped: ${error?.message || error}`
+    );
+
+    throw error;
   } finally {
     if (driver) {
       await driver.quit().catch(() => {});
