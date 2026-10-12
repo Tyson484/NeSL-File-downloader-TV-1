@@ -562,17 +562,23 @@ export async function runDownloadJob({
   job,
   onProgress
 }) {
-  const downloadDir = ensureDir(
-    process.env.DOWNLOAD_DIR || './downloads'
+  const tempRoot = path.join(
+    process.env.TMPDIR || '/tmp',
+    'nesl-file-downloader',
+    job.id
   );
 
-  const outputDir = ensureDir(
-    process.env.OUTPUT_DIR || './output'
-  );
+  await fs.promises.mkdir(tempRoot, { recursive: true });
 
-  const statusDir = ensureDir(
-    process.env.STATUS_DIR || './status'
-  );
+  const downloadDir = path.join(tempRoot, 'downloads');
+  const outputDir = path.join(tempRoot, 'output');
+  const statusDir = path.join(tempRoot, 'status');
+
+  await Promise.all([
+    fs.promises.mkdir(downloadDir, { recursive: true }),
+    fs.promises.mkdir(outputDir, { recursive: true }),
+    fs.promises.mkdir(statusDir, { recursive: true })
+  ]);
 
   const jobPrefix = `nesl-${job.id.slice(0, 8)}`;
 

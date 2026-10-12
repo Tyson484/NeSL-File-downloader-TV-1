@@ -16,6 +16,42 @@ const origin = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
 app.use(cors({ origin: origin.split(',').map(s => s.trim()), methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '2mb' }));
 
+// Remove temporary files belonging to a completed job.
+async function cleanupJobFiles(job) {
+  if (!job?.outputDirectory) return;
+
+  const tempRoot = path.dirname(job.outputDirectory);
+
+  try {
+    await fs.promises.rm(tempRoot, {
+      recursive: true,
+      force: true
+    });
+
+    job.outputDirectory = null;
+    job.statusFiles = {};
+    job.pdfFiles = [];
+  } catch (error) {
+    console.error("Temporary-file cleanup failed:", error.message);
+  }
+}
+
+// Automatically remove temporary job files after 30 minutes.
+const CLEANUP_AFTER_MS = 30 * 60 * 1000;
+
+function scheduleJobCleanup(job) {
+  if (job.cleanupTimer) {
+    clearTimeout(job.cleanupTimer);
+  }
+
+  job.cleanupTimer = setTimeout(async () => {
+    await cleanupJobFiles(job);
+    jobs.delete(job.id);
+  }, CLEANUP_AFTER_MS);
+
+  job.cleanupTimer.unref();
+}
+
 const jobs = new Map();
 let running = false;
 
@@ -50,6 +86,10 @@ app.post('/api/jobs', async (req, res) => {
     } finally {
       job.finishedAt = new Date().toISOString();
       running = false;
+
+      if (job.outputDirectory) {
+        scheduleJobCleanup(job);
+      }
     }
   });
 });
@@ -57,7 +97,8 @@ app.post('/api/jobs', async (req, res) => {
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found. Jobs are kept in memory until this backend restarts.' });
-  res.json(job);
+  const { cleanupTimer, ...publicJob } = job;
+  res.json(publicJob);
 });
 
 app.get('/api/jobs/:id/results.csv', (req, res) => {
@@ -72,33 +113,95 @@ app.get('/api/jobs/:id/results.csv', (req, res) => {
 
 app.get('/api/jobs/:id/files/:transactionId.pdf', (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  if (!['completed', 'failed'].includes(job.status)) return res.status(409).json({ error: 'Wait until the job finishes before downloading PDFs.' });
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found.' });
+  }
+
+  if (!['completed', 'failed'].includes(job.status)) {
+    return res.status(409).json({
+      error: 'Wait until the job finishes before downloading PDFs.'
+    });
+  }
+
   const requestedId = req.params.transactionId;
-  const result = (job.results || []).find(r => r.status === 'SUCCESS' && r.transactionId === requestedId && r.file);
-  if (!result) return res.status(404).json({ error: 'No successfully downloaded PDF exists for this transaction ID.' });
+  const result = (job.results || []).find(
+    r => r.status === 'SUCCESS' &&
+         r.transactionId === requestedId &&
+         r.file
+  );
+
+  if (!result) {
+    return res.status(404).json({
+      error: 'No successfully downloaded PDF exists for this transaction ID.'
+    });
+  }
+
   const filePath = path.join(job.outputDirectory || '', result.file);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'The PDF file is no longer available on the backend.' });
-  res.download(filePath, `${result.transactionId}.pdf`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: 'The PDF file is no longer available on the backend.'
+    });
+  }
+
+  res.download(filePath, `${result.transactionId}.pdf`, err => {
+    if (err) {
+      console.error('PDF download error:', err.message);
+    }
+  });
 });
 
 app.get('/api/jobs/:id/downloads.zip', (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  if (!['completed', 'failed'].includes(job.status)) return res.status(409).json({ error: 'Wait until the job finishes before exporting files.' });
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found.' });
+  }
+
+  if (!['completed', 'failed'].includes(job.status)) {
+    return res.status(409).json({
+      error: 'Wait until the job finishes before exporting files.'
+    });
+  }
+
   res.setHeader('Content-Type', 'application/zip');
-  res.setHeader('Content-Disposition', `attachment; filename="nesl-file-downloader-${job.id.slice(0, 8)}.zip"`);
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="nesl-file-downloader-${job.id.slice(0, 8)}.zip"`
+  );
+
   const archive = archiver('zip', { zlib: { level: 6 } });
-  archive.on('error', err => { if (!res.headersSent) res.status(500).json({ error: err.message }); else res.destroy(err); });
+
+  archive.on('error', async err => {
+    console.error('ZIP archive error:', err.message);
+
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Could not create ZIP file.' });
+    } else {
+      res.destroy(err);
+    }
+
+  });
+
   archive.pipe(res);
+
   for (const result of job.results || []) {
     if (result.status !== 'SUCCESS' || !result.file) continue;
+
     const filePath = path.join(job.outputDirectory || '', result.file);
-    if (fs.existsSync(filePath)) archive.file(filePath, { name: `PDFs/${result.file}` });
+
+    if (fs.existsSync(filePath)) {
+      archive.file(filePath, { name: `PDFs/${result.file}` });
+    }
   }
+
   for (const [kind, filePath] of Object.entries(job.statusFiles || {})) {
-    if (filePath && fs.existsSync(filePath)) archive.file(filePath, { name: `Status/${path.basename(filePath)}` });
+    if (filePath && fs.existsSync(filePath)) {
+      archive.file(filePath, { name: `Status/${path.basename(filePath)}` });
+    }
   }
+
   archive.finalize();
 });
 
